@@ -1,0 +1,552 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>飞机模拟（气流/失速/风切变）</title>
+  <style>
+    html,body{height:100%;margin:0;background:#0b1220;color:#e6eefc;font-family:system-ui,Segoe UI,Roboto,Arial}
+    #wrap{display:flex;flex-direction:column;height:100%}
+    #hud{
+      padding:10px 14px;display:flex;gap:10px;align-items:center;flex-wrap:wrap;
+      border-bottom:1px solid rgba(255,255,255,.10);
+      background:linear-gradient(180deg, rgba(255,255,255,.06), rgba(255,255,255,.02));
+    }
+    .pill{padding:4px 10px;border:1px solid rgba(255,255,255,.14);border-radius:999px;background:rgba(255,255,255,.04)}
+    .small{font-size:12px;opacity:.85}
+    #readout{margin-left:auto}
+    canvas{flex:1;display:block;width:100%;height:100%}
+    kbd{padding:1px 6px;border:1px solid rgba(255,255,255,.18);border-bottom-width:2px;border-radius:6px;background:rgba(0,0,0,.25)}
+  </style>
+</head>
+<body>
+<div id="wrap">
+  <div id="hud">
+    <span class="pill"><kbd>W/S</kbd> 升降舵（俯仰）</span>
+    <span class="pill"><kbd>A/D</kbd> 副翼（滚转/损失升力）</span>
+    <span class="pill"><kbd>↑/↓</kbd> 油门</span>
+    <span class="pill"><kbd>Q/E</kbd> 配平（Trim）</span>
+    <span class="pill"><kbd>Space</kbd> 重置</span>
+    <span class="pill small">模拟：AoA / 失速 / 风切变 / 热气流 / 阵风 / 乱流</span>
+    <span id="readout" class="small"></span>
+  </div>
+  <canvas id="c"></canvas>
+</div>
+
+<script>
+(() => {
+  const canvas = document.getElementById('c');
+  const ctx = canvas.getContext('2d');
+  const readout = document.getElementById('readout');
+
+  // ---------- resize ----------
+  function resize(){
+    const dpr = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
+    canvas.width = Math.floor(canvas.clientWidth * dpr);
+    canvas.height = Math.floor(canvas.clientHeight * dpr);
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+  }
+  window.addEventListener('resize', resize);
+
+  // ---------- input ----------
+  const keys = new Set();
+  window.addEventListener('keydown', e => {
+    keys.add(e.code);
+    if(['Space','ArrowUp','ArrowDown'].includes(e.code)) e.preventDefault();
+  });
+  window.addEventListener('keyup', e => keys.delete(e.code));
+
+  // ---------- helpers ----------
+  const clamp = (v,a,b)=>Math.max(a,Math.min(b,v));
+  const lerp  = (a,b,t)=>a+(b-a)*t;
+  const smoothstep = t => t*t*(3-2*t);
+  const rad2deg = r => r*57.29577951308232;
+
+  // Deterministic value-noise (cheap) + fbm
+  function hash2(x,y){
+    let n = x*374761393 + y*668265263;
+    n = (n ^ (n >> 13)) * 1274126177;
+    return ((n ^ (n >> 16)) >>> 0) / 4294967295; // 0..1
+  }
+  function valueNoise(x,y){
+    const x0 = Math.floor(x), y0 = Math.floor(y);
+    const x1 = x0+1, y1 = y0+1;
+    const sx = smoothstep(x - x0);
+    const sy = smoothstep(y - y0);
+    const v00 = hash2(x0,y0);
+    const v10 = hash2(x1,y0);
+    const v01 = hash2(x0,y1);
+    const v11 = hash2(x1,y1);
+    const ix0 = lerp(v00,v10,sx);
+    const ix1 = lerp(v01,v11,sx);
+    return lerp(ix0,ix1,sy); // 0..1
+  }
+  function fbm(x,y,oct=4){
+    let f=1, a=1, sum=0, norm=0;
+    for(let i=0;i<oct;i++){
+      sum += a*(valueNoise(x*f,y*f)*2-1);
+      norm += a;
+      a *= 0.5;
+      f *= 2;
+    }
+    return sum / norm; // ~ -1..1
+  }
+
+  // ---------- world ----------
+  // Screen coords: x right+, y down+.
+  const world = {
+    minY: 60,     // "ceiling"
+    groundY: 560, // "ground"
+  };
+
+  const camera = {x:0,y:0};
+
+  // ---------- wind field ----------
+  // Wind is an air-mass velocity field that varies with time + position + altitude (wind shear).
+  const wind = {
+    t: 0,
+    gustTarget: {x:0,y:0},
+    gust: {x:0,y:0},
+    gustTimer: 0,
+    thermals: [],
+    spawnThermal(aheadX){
+      const cx = aheadX + 600 + Math.random()*1400;
+      const cy = 110 + Math.random()*420;
+      const r = 90 + Math.random()*190;
+      // Updraft more likely than sink, but both exist.
+      const strength = (Math.random()<0.7 ? 1 : -1) * (55 + Math.random()*120); // px/s
+      const life = 10 + Math.random()*14;
+      this.thermals.push({cx,cy,r,strength,age:0,life});
+    }
+  };
+
+  // ---------- plane model ----------
+  // Side-view "sim-ish": aerodynamic forces based on Angle of Attack (AoA) + stall curve.
+  const plane = {
+    x: 220, y: 320,
+    vx: 220, vy: 0,
+    pitch: 0.02,     // body angle relative to horizon (rad). + = nose up (in screen coords, up is -y so nose up is negative rotation visually; we handle in draw)
+    pitchRate: 0,
+    roll: 0, rollRate: 0, // bank angle (rad) -> reduces vertical lift, adds some lateral coupling
+    throttle: 0.62,  // 0..1
+    trim: 0.00,      // -..+ adds to pitch target
+    health: 1.0,     // for crash feedback
+  };
+
+  function reset(){
+    plane.x=220; plane.y=320;
+    plane.vx=220; plane.vy=0;
+    plane.pitch=0.02; plane.pitchRate=0;
+    plane.roll=0; plane.rollRate=0;
+    plane.throttle=0.62;
+    plane.trim=0.0;
+    plane.health=1.0;
+
+    wind.t=0;
+    wind.gust={x:0,y:0};
+    wind.gustTarget={x:0,y:0};
+    wind.gustTimer=0;
+    wind.thermals.length=0;
+    for(let i=0;i<7;i++) wind.spawnThermal(0);
+  }
+
+  // ---------- draw helpers ----------
+  function drawSky(w,h){
+    const g = ctx.createLinearGradient(0,0,0,h);
+    g.addColorStop(0,"#071023");
+    g.addColorStop(0.55,"#0f2a52");
+    g.addColorStop(1,"#1a3f6f");
+    ctx.fillStyle = g;
+    ctx.fillRect(0,0,w,h);
+  }
+
+  function drawTerrain(w,h){
+    // ground strip
+    ctx.save();
+    ctx.fillStyle = "rgba(0,0,0,0.35)";
+    ctx.fillRect(0, world.groundY, w, h-world.groundY);
+    ctx.globalAlpha = 0.25;
+    ctx.strokeStyle = "#b9d1ff";
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(0, world.groundY);
+    ctx.lineTo(w, world.groundY);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  function drawThermals(){
+    for(const th of wind.thermals){
+      const x = th.cx - camera.x;
+      const y = th.cy - camera.y;
+      const t = th.age / th.life;
+      const alpha = 0.22 * (1 - clamp((t-0.75)/0.25,0,1));
+      ctx.save();
+      ctx.globalAlpha = alpha;
+      ctx.strokeStyle = th.strength>0 ? "#ffd37a" : "#8bd3ff";
+      ctx.lineWidth = 2;
+      ctx.setLineDash([7,7]);
+      ctx.beginPath();
+      ctx.arc(x,y,th.r,0,Math.PI*2);
+      ctx.stroke();
+
+      // arrow
+      ctx.setLineDash([]);
+      ctx.globalAlpha *= 0.9;
+      ctx.beginPath();
+      ctx.moveTo(x, y);
+      ctx.lineTo(x, y + (th.strength>0 ? -22 : 22));
+      ctx.stroke();
+
+      ctx.restore();
+    }
+  }
+
+  function drawPlane(){
+    const x = plane.x - camera.x;
+    const y = plane.y - camera.y;
+
+    // Visual: in screen coords, positive pitch should tilt nose upward (towards -y),
+    // so we rotate by -pitch.
+    const visualAngle = -plane.pitch;
+
+    ctx.save();
+    ctx.translate(x,y);
+    ctx.rotate(visualAngle);
+
+    // fuselage
+    ctx.fillStyle = "rgba(255,255,255,0.95)";
+    ctx.strokeStyle = "rgba(20,30,45,0.9)";
+    ctx.lineWidth = 2;
+
+    ctx.beginPath();
+    ctx.roundRect(-30,-6,60,12,6);
+    ctx.fill(); ctx.stroke();
+
+    // wing (bank/roll just for display)
+    ctx.save();
+    ctx.rotate(plane.roll*0.8);
+    ctx.beginPath();
+    ctx.roundRect(-9,-24,18,48,8);
+    ctx.fillStyle="rgba(230,245,255,0.9)";
+    ctx.fill(); ctx.stroke();
+    ctx.restore();
+
+    // tailplane
+    ctx.beginPath();
+    ctx.roundRect(-34,-3,12,6,3);
+    ctx.fillStyle="rgba(220,235,255,0.9)";
+    ctx.fill(); ctx.stroke();
+
+    // prop/nose
+    ctx.fillStyle="#ffcc66";
+    ctx.beginPath();
+    ctx.arc(30,0,3,0,Math.PI*2);
+    ctx.fill();
+
+    ctx.restore();
+  }
+
+  // roundRect polyfill
+  if(!CanvasRenderingContext2D.prototype.roundRect){
+    CanvasRenderingContext2D.prototype.roundRect = function(x,y,w,h,r){
+      r = Math.min(r, w/2, h/2);
+      this.beginPath();
+      this.moveTo(x+r,y);
+      this.arcTo(x+w,y,x+w,y+h,r);
+      this.arcTo(x+w,y+h,x,y+h,r);
+      this.arcTo(x,y+h,x,y,r);
+      this.arcTo(x,y,x+w,y,r);
+      this.closePath();
+      return this;
+    }
+  }
+
+  function drawVignette(w,h){
+    ctx.save();
+    ctx.globalAlpha = 0.20;
+    const g = ctx.createRadialGradient(w/2,h/2, 40, w/2,h/2, Math.max(w,h)*0.70);
+    g.addColorStop(0,"rgba(0,0,0,0)");
+    g.addColorStop(1,"rgba(0,0,0,1)");
+    ctx.fillStyle = g;
+    ctx.fillRect(0,0,w,h);
+    ctx.restore();
+  }
+
+  // ---------- physics ----------
+  function stallFactor(aoa, stallDeg=15){
+    // aoa in rad. We want: linear near 0, peak around stall, then drops (but not to zero).
+    const stall = stallDeg * Math.PI/180;
+    const a = Math.abs(aoa);
+    if(a <= stall) return 1.0;
+
+    // post-stall decay: smooth drop towards ~0.35
+    const t = clamp((a - stall) / (25*Math.PI/180), 0, 1);
+    return lerp(1.0, 0.35, smoothstep(t));
+  }
+
+  function step(dt){
+    // inputs
+    const elev = (keys.has('KeyW')?1:0) + (keys.has('KeyS')?-1:0);
+    const ail  = (keys.has('KeyD')?1:0) + (keys.has('KeyA')?-1:0);
+    const thr  = (keys.has('ArrowUp')?1:0) + (keys.has('ArrowDown')?-1:0);
+    const trimInput = (keys.has('KeyE')?1:0) + (keys.has('KeyQ')?-1:0);
+
+    if(keys.has('Space')) reset();
+
+    // trim
+    plane.trim = clamp(plane.trim + trimInput*0.28*dt, -0.35, 0.35);
+
+    // throttle with inertia
+    const throttleTarget = clamp(plane.throttle + thr*0.55*dt, 0, 1);
+    plane.throttle = lerp(plane.throttle, throttleTarget, 1 - Math.exp(-3.5*dt));
+
+    // pitch control (rate-limited)
+    const pitchCmd = elev*1.6 + plane.trim;          // command in rad/s-ish
+    const pitchTargetRate = pitchCmd * 2.2;          // how hard elevator responds
+    plane.pitchRate = lerp(plane.pitchRate, pitchTargetRate, 1 - Math.exp(-9*dt));
+    plane.pitch += plane.pitchRate * dt;
+    plane.pitch = clamp(plane.pitch, -0.65, 0.65);   // keep it flyable
+
+    // roll/bank
+    const rollTargetRate = ail * 3.2;
+    plane.rollRate = lerp(plane.rollRate, rollTargetRate, 1 - Math.exp(-10*dt));
+    plane.roll += plane.rollRate * dt;
+    plane.roll = clamp(plane.roll, -1.05, 1.05);
+
+    // --- wind update ---
+    wind.t += dt;
+    wind.gustTimer -= dt;
+    if(wind.gustTimer <= 0){
+      wind.gustTimer = 2 + Math.random()*3.5;
+      wind.gustTarget.x = (Math.random()*2-1) * (40 + Math.random()*110);
+      wind.gustTarget.y = (Math.random()*2-1) * (25 + Math.random()*80);
+    }
+    wind.gust.x = lerp(wind.gust.x, wind.gustTarget.x, 1 - Math.exp(-1.1*dt));
+    wind.gust.y = lerp(wind.gust.y, wind.gustTarget.y, 1 - Math.exp(-1.1*dt));
+
+    // altitude factor for wind shear (higher altitude => more wind)
+    const altitude = clamp(world.groundY - plane.y, 0, world.groundY-world.minY);
+    const shear = lerp(0.55, 1.25, clamp(altitude/420, 0, 1)); // 0.55 near ground, 1.25 up high
+
+    const turbScale = 0.014;
+    const tx = (plane.x)*turbScale + wind.t*0.9;
+    const ty = (plane.y)*turbScale - wind.t*0.6;
+    const turbX = fbm(tx,ty,4) * 26 * shear;
+    const turbY = fbm(tx+60,ty-40,4) * 20 * shear;
+
+    // thermals
+    let thermalWx = 0, thermalWy = 0;
+    const aheadX = camera.x + 1200;
+    // recycle / ensure density
+    if(wind.thermals.length < 7) wind.spawnThermal(aheadX);
+    for(const th of wind.thermals){
+      th.age += dt;
+      if(th.age > th.life){
+        th.cx = aheadX + 600 + Math.random()*1400;
+        th.cy = 110 + Math.random()*420;
+        th.r  = 90 + Math.random()*210;
+        th.strength = (Math.random()<0.7 ? 1 : -1) * (55 + Math.random()*130);
+        th.age = 0;
+        th.life = 10 + Math.random()*16;
+      }
+      const dx = plane.x - th.cx;
+      const dy = plane.y - th.cy;
+      const d = Math.hypot(dx,dy);
+      if(d < th.r){
+        const k = 1 - (d/th.r);
+        const fall = k*k*(3-2*k);
+        thermalWy += th.strength * fall;
+
+        // swirl around thermal
+        const swirl = (th.strength>0 ? 1 : -1) * 28 * fall;
+        thermalWx += (-dy / (d+1)) * swirl;
+        thermalWy += ( dx / (d+1)) * swirl * 0.16;
+      }
+    }
+
+    const windWx = (wind.gust.x + turbX + thermalWx) * shear;
+    const windWy = (wind.gust.y + turbY + thermalWy) * shear;
+
+    // --- aerodynamics ---
+    // Relative air velocity (plane relative to air mass)
+    const relVx = plane.vx - windWx;
+    const relVy = plane.vy - windWy;
+    const V = Math.max(1e-4, Math.hypot(relVx, relVy));
+
+    // Flow angle in screen coords
+    const flowAng = Math.atan2(relVy, relVx); // y-down
+    const aoa = plane.pitch - flowAng;
+
+    // Lift coefficient curve (linear then stall)
+    const Cl_alpha = 4.8;                  // per rad
+    const Cl = Cl_alpha * aoa * stallFactor(aoa, 15);
+
+    // Drag polar
+    const Cd0 = 0.028;                     // parasitic
+    const k   = 0.065;                     // induced
+    const Cd = Cd0 + k * Cl * Cl;
+
+    // Dynamic pressure scale (tuned for pixels)
+    const q = 0.0022 * V * V;
+
+    // Lift magnitude
+    // Lift acts perpendicular to relative wind (to the "left" of flow direction).
+    const L = q * Cl * 120000;             // tuned constant
+
+    // Drag magnitude
+    const D = q * Cd * 120000;
+
+    // Unit vectors
+    const ux = relVx / V;
+    const uy = relVy / V;
+
+    // Drag opposite rel velocity
+    const Fx_drag = -D * ux;
+    const Fy_drag = -D * uy;
+
+    // Lift: rotate (ux,uy) by -90deg gives (uy, -ux); by +90 gives (-uy, ux).
+    // For a conventional wing, positive AoA should generate upward lift (negative y).
+    // With y-down coords, upward is negative. We'll choose lift vector = (-uy, ux) * L
+    const Fx_lift = (-uy) * L;
+    const Fy_lift = ( ux) * L;
+
+    // Bank (roll) reduces vertical lift component and leaks some into horizontal (simulating turning/energy loss)
+    const bank = plane.roll;
+    const bankLoss = Math.cos(bank);
+    const bankLeak = Math.sin(bank);
+
+    // Apply bank to lift vector in a simple way: scale lift with bankLoss, add a small sideways coupling with bankLeak
+    const Fx_lift_b = Fx_lift * bankLoss + Fy_lift * bankLeak * 0.25;
+    const Fy_lift_b = Fy_lift * bankLoss;
+
+    // Thrust along body axis (pitch)
+    const thrust = lerp(120, 900, plane.throttle); // px/s^2-ish * mass scaling
+    const Fx_th = Math.cos(plane.pitch) * thrust;
+    const Fy_th = Math.sin(plane.pitch) * thrust;
+
+    // Gravity (y-down)
+    const g = 270;
+
+    // Total acceleration (divide by mass)
+    const mass = 90; // bigger = heavier
+    let ax = (Fx_drag + Fx_lift_b + Fx_th) / mass;
+    let ay = (Fy_drag + Fy_lift_b + Fy_th) / mass + g;
+
+    // Air mass advection (wind carries you a bit)
+    const advect = 0.55;
+    ax += (windWx - plane.vx) * advect * 0.011;
+    ay += (windWy - plane.vy) * advect * 0.011;
+
+    // integrate
+    plane.vx += ax * dt;
+    plane.vy += ay * dt;
+
+    // speed limits
+    const sp = Math.hypot(plane.vx, plane.vy);
+    const maxV = 720;
+    if(sp > maxV){ plane.vx *= maxV/sp; plane.vy *= maxV/sp; }
+
+    plane.x += plane.vx * dt;
+    plane.y += plane.vy * dt;
+
+    // boundaries
+    if(plane.y < world.minY){
+      plane.y = world.minY;
+      plane.vy = Math.max(plane.vy, 40); // push down
+    }
+
+    // ground collision / "damage"
+    if(plane.y > world.groundY){
+      const impact = Math.abs(plane.vy);
+      plane.y = world.groundY;
+      plane.vy *= -0.25;
+      plane.vx *= 0.55;
+      plane.health -= clamp((impact-120)/480, 0, 0.45);
+      plane.health = clamp(plane.health, 0, 1);
+      if(plane.health <= 0){
+        // soft reset
+        reset();
+        return;
+      }
+    }else{
+      // recover health slowly if flying nicely
+      plane.health = clamp(plane.health + 0.02*dt, 0, 1);
+    }
+
+    // camera follow
+    camera.x = plane.x - 260;
+    camera.y = 0;
+
+    // HUD numbers
+    const ias = V; // "indicated airspeed" proxy
+    const vs  = -plane.vy; // vertical speed up+
+    const stallWarn = Math.abs(rad2deg(aoa)) > 14.5 && V < 260;
+
+    readout.textContent =
+      `IAS:${ias.toFixed(0)}  ALT:${(altitude).toFixed(0)}  VS:${vs.toFixed(0)}  AoA:${rad2deg(aoa).toFixed(1)}°  Cl:${Cl.toFixed(2)}  风:${windWx.toFixed(0)},${windWy.toFixed(0)}  配平:${rad2deg(plane.trim).toFixed(0)}°  ${stallWarn?'⚠️ 失速边缘':''}`;
+
+    // Save for render effects
+    plane._dbg = {ias, altitude, vs, aoa, Cl, Cd, stallWarn, windWx, windWy, V};
+  }
+
+  // ---------- render ----------
+  function render(){
+    const w = canvas.clientWidth;
+    const h = canvas.clientHeight;
+    ctx.clearRect(0,0,w,h);
+
+    drawSky(w,h);
+
+    // clouds streaks (parallax)
+    ctx.save();
+    ctx.globalAlpha = 0.16;
+    ctx.fillStyle = "#cfe0ff";
+    for(let i=0;i<22;i++){
+      const cx = ((i*240 + 140) - (camera.x*0.28)) % (w+320) - 160;
+      const cy = 70 + (i*41)%240;
+      ctx.fillRect(cx, cy, 120, 2);
+    }
+    ctx.restore();
+
+    drawThermals();
+    drawTerrain(w,h);
+    drawPlane();
+
+    // stall shake / damage tint
+    const dbg = plane._dbg || {};
+    if(dbg.stallWarn){
+      ctx.save();
+      ctx.globalAlpha = 0.10;
+      ctx.fillStyle = "#ffcc66";
+      ctx.fillRect(0,0,w,h);
+      ctx.restore();
+    }
+    if(plane.health < 0.55){
+      ctx.save();
+      ctx.globalAlpha = (0.55 - plane.health) * 0.35;
+      ctx.fillStyle = "#ff5a5a";
+      ctx.fillRect(0,0,w,h);
+      ctx.restore();
+    }
+
+    drawVignette(w,h);
+  }
+
+  // ---------- loop ----------
+  let last = performance.now();
+  function loop(now){
+    const dt = clamp((now-last)/1000, 0, 0.033);
+    last = now;
+    step(dt);
+    render();
+    requestAnimationFrame(loop);
+  }
+
+  resize();
+  reset();
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
