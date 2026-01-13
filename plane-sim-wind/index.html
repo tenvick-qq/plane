@@ -107,6 +107,7 @@
     t: 0,
     gustTarget: {x:0,y:0},
     gust: {x:0,y:0},
+    smooth: {x:0,y:0},
     gustTimer: 0,
     thermals: [],
     spawnThermal(aheadX){
@@ -145,6 +146,7 @@
     wind.t=0;
     wind.gust={x:0,y:0};
     wind.gustTarget={x:0,y:0};
+    wind.smooth={x:0,y:0};
     wind.gustTimer=0;
     wind.thermals.length=0;
     for(let i=0;i<7;i++) wind.spawnThermal(0);
@@ -367,11 +369,14 @@
 
     const windWx = (wind.gust.x + turbX + thermalWx) * shear;
     const windWy = (wind.gust.y + turbY + thermalWy) * shear;
+    const windSmooth = 1 - Math.exp(-4 * dt);
+    wind.smooth.x = lerp(wind.smooth.x, windWx, windSmooth);
+    wind.smooth.y = lerp(wind.smooth.y, windWy, windSmooth);
 
     // --- aerodynamics ---
     // Relative air velocity (plane relative to air mass)
-    const relVx = plane.vx - windWx;
-    const relVy = plane.vy - windWy;
+    const relVx = plane.vx - wind.smooth.x;
+    const relVy = plane.vy - wind.smooth.y;
     const V = Math.max(1e-4, Math.hypot(relVx, relVy));
 
     // Flow angle in screen coords
@@ -435,8 +440,8 @@
 
     // Air mass advection (wind carries you a bit)
     const advect = 0.55;
-    ax += (windWx - plane.vx) * advect * 0.011;
-    ay += (windWy - plane.vy) * advect * 0.011;
+    ax += (wind.smooth.x - plane.vx) * advect * 0.011;
+    ay += (wind.smooth.y - plane.vy) * advect * 0.011;
 
     // integrate
     plane.vx += ax * dt;
@@ -484,7 +489,7 @@
     const stallWarn = Math.abs(rad2deg(aoa)) > 14.5 && V < 260;
 
     readout.textContent =
-      `IAS:${ias.toFixed(0)}  ALT:${(altitude).toFixed(0)}  VS:${vs.toFixed(0)}  AoA:${rad2deg(aoa).toFixed(1)}°  Cl:${Cl.toFixed(2)}  风:${windWx.toFixed(0)},${windWy.toFixed(0)}  配平:${rad2deg(plane.trim).toFixed(0)}°  ${stallWarn?'⚠️ 失速边缘':''}`;
+      `IAS:${ias.toFixed(0)}  ALT:${(altitude).toFixed(0)}  VS:${vs.toFixed(0)}  AoA:${rad2deg(aoa).toFixed(1)}°  Cl:${Cl.toFixed(2)}  风:${wind.smooth.x.toFixed(0)},${wind.smooth.y.toFixed(0)}  配平:${rad2deg(plane.trim).toFixed(0)}°  ${stallWarn?'⚠️ 失速边缘':''}`;
 
     // Save for render effects
     plane._dbg = {ias, altitude, vs, aoa, Cl, Cd, stallWarn, windWx, windWy, V};
