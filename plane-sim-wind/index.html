@@ -107,6 +107,7 @@
     t: 0,
     gustTarget: {x:0,y:0},
     gust: {x:0,y:0},
+    smooth: {x:0,y:0},
     gustTimer: 0,
     thermals: [],
     spawnThermal(aheadX){
@@ -119,6 +120,139 @@
       this.thermals.push({cx,cy,r,strength,age:0,life});
     }
   };
+
+  // ---------- terrain ----------
+  const terrain = {
+    seed: 1337,
+    amp: 140,
+    freq: 0.0018,
+    octaves: 4,
+    waterLevel: 16,
+    airportSpacing: 2200,
+    runwaySize: 220,
+    blendRadius: 160,
+    flattenHeight: 26,
+    chunkSize: 480,
+    sampleStep: 24,
+    earthRadius: 2400,
+    cache: new Map(),
+    airportCache: new Map(),
+  };
+
+  function hash1(n){
+    let x = (n ^ (n >>> 16)) >>> 0;
+    x = Math.imul(x, 2246822519);
+    x ^= x >>> 13;
+    x = Math.imul(x, 3266489917);
+    x ^= x >>> 16;
+    return (x >>> 0) / 4294967295;
+  }
+
+  function getEarthBaseY(worldX){
+    const r = terrain.earthRadius;
+    const wrap = ((worldX % (2 * r)) + 2 * r) % (2 * r);
+    const dx = wrap - r;
+    const cy = world.groundY + r;
+    const y = cy - Math.sqrt(Math.max(0, r * r - dx * dx));
+    return y;
+  }
+
+  function getAirport(cellIndex){
+    if(terrain.airportCache.has(cellIndex)){
+      return terrain.airportCache.get(cellIndex);
+    }
+    const rng = hash1(cellIndex * 928371 + terrain.seed * 173);
+    const hasAirport = rng > 0.82;
+    if(!hasAirport){
+      terrain.airportCache.set(cellIndex, null);
+      return null;
+    }
+    const offset = (hash1(cellIndex * 593 + terrain.seed * 41) - 0.5) * 0.6;
+    const x = (cellIndex + 0.5 + offset) * terrain.airportSpacing;
+    const airport = {x};
+    terrain.airportCache.set(cellIndex, airport);
+    return airport;
+  }
+
+  function getBaseHeight(worldX){
+    const {chunkSize, sampleStep, freq, amp, octaves, seed} = terrain;
+    const chunkIndex = Math.floor(worldX / chunkSize);
+    let chunk = terrain.cache.get(chunkIndex);
+    if(!chunk){
+      const sampleCount = Math.ceil(chunkSize / sampleStep) + 1;
+      const samples = new Array(sampleCount);
+      const startX = chunkIndex * chunkSize;
+      for(let i=0;i<sampleCount;i++){
+        const x = startX + i * sampleStep;
+        const n = fbm(x * freq, seed * 0.017, octaves);
+        samples[i] = n * amp;
+      }
+      chunk = {startX, samples};
+      terrain.cache.set(chunkIndex, chunk);
+    }
+    const localX = worldX - chunk.startX;
+    const idx = clamp(Math.floor(localX / sampleStep), 0, chunk.samples.length - 1);
+    return chunk.samples[idx];
+  }
+
+  function getTerrainHeight(worldX){
+    let height = getBaseHeight(worldX);
+    const spacing = terrain.airportSpacing;
+    const cell = Math.floor(worldX / spacing);
+    let best = null;
+    for(let i=-1;i<=1;i++){
+      const airport = getAirport(cell + i);
+      if(!airport) continue;
+      const dist = Math.abs(worldX - airport.x);
+      const half = terrain.runwaySize * 0.5;
+      if(dist <= half){
+        height = terrain.flattenHeight;
+        best = null;
+        break;
+      }
+      if(dist <= half + terrain.blendRadius){
+        const t = clamp((dist - half) / terrain.blendRadius, 0, 1);
+        const blend = smoothstep(t);
+        const flattened = lerp(terrain.flattenHeight, height, blend);
+        if(best === null || flattened < best){
+          best = flattened;
+        }
+      }
+    }
+    if(best !== null){
+      height = best;
+    }
+    return height;
+  }
+
+  function getTerrainSample(worldX){
+    const baseY = getEarthBaseY(worldX);
+    const height = getTerrainHeight(worldX);
+    const water = height < terrain.waterLevel;
+    const landHeight = Math.max(height, terrain.waterLevel);
+    return {
+      baseY,
+      groundY: baseY - landHeight,
+      waterY: baseY - terrain.waterLevel,
+      height,
+      water,
+    };
+  }
+
+  function getAirportsInRange(minX, maxX){
+    const spacing = terrain.airportSpacing;
+    const startCell = Math.floor(minX / spacing) - 1;
+    const endCell = Math.floor(maxX / spacing) + 1;
+    const airports = [];
+    for(let cell = startCell; cell <= endCell; cell++){
+      const airport = getAirport(cell);
+      if(!airport) continue;
+      if(airport.x >= minX - spacing && airport.x <= maxX + spacing){
+        airports.push(airport);
+      }
+    }
+    return airports;
+  }
 
   // ---------- plane model ----------
   // Side-view "sim-ish": aerodynamic forces based on Angle of Attack (AoA) + stall curve.
@@ -145,9 +279,13 @@
     wind.t=0;
     wind.gust={x:0,y:0};
     wind.gustTarget={x:0,y:0};
+    wind.smooth={x:0,y:0};
     wind.gustTimer=0;
     wind.thermals.length=0;
     for(let i=0;i<7;i++) wind.spawnThermal(0);
+
+    terrain.cache.clear();
+    terrain.airportCache.clear();
   }
 
   // ---------- draw helpers ----------
@@ -161,17 +299,62 @@
   }
 
   function drawTerrain(w,h){
-    // ground strip
+    // curved ground (earth-like)
     ctx.save();
-    ctx.fillStyle = "rgba(0,0,0,0.35)";
-    ctx.fillRect(0, world.groundY, w, h-world.groundY);
-    ctx.globalAlpha = 0.25;
+    const worldStart = camera.x;
+    const worldEnd = camera.x + w;
+    const step = terrain.sampleStep;
+    const samples = [];
+    for(let sx = 0; sx <= w + step; sx += step){
+      const worldX = worldStart + sx;
+      samples.push({sx, worldX, ...getTerrainSample(worldX)});
+    }
+
+    // water
+    ctx.fillStyle = "rgba(15,44,80,0.65)";
+    ctx.beginPath();
+    ctx.moveTo(0, h);
+    for(const s of samples){
+      if(s.water){
+        ctx.lineTo(s.sx, s.waterY);
+      }else{
+        ctx.lineTo(s.sx, h);
+      }
+    }
+    ctx.lineTo(w, h);
+    ctx.closePath();
+    ctx.fill();
+
+    // land
+    ctx.fillStyle = "rgba(4,8,12,0.75)";
+    ctx.beginPath();
+    ctx.moveTo(0, h);
+    for(const s of samples){
+      ctx.lineTo(s.sx, s.groundY);
+    }
+    ctx.lineTo(w, h);
+    ctx.closePath();
+    ctx.fill();
+
+    // horizon stroke
+    ctx.globalAlpha = 0.35;
     ctx.strokeStyle = "#b9d1ff";
     ctx.lineWidth = 2;
     ctx.beginPath();
-    ctx.moveTo(0, world.groundY);
-    ctx.lineTo(w, world.groundY);
+    for(const s of samples){
+      ctx.lineTo(s.sx, s.baseY);
+    }
     ctx.stroke();
+
+    // airports
+    const airports = getAirportsInRange(worldStart, worldEnd);
+    ctx.globalAlpha = 0.7;
+    ctx.fillStyle = "#e7e2d3";
+    for(const airport of airports){
+      const sx = airport.x - camera.x;
+      const {groundY} = getTerrainSample(airport.x);
+      ctx.fillRect(sx - terrain.runwaySize * 0.5, groundY - 6, terrain.runwaySize, 8);
+    }
     ctx.restore();
   }
 
@@ -247,6 +430,39 @@
     ctx.restore();
   }
 
+  function drawFlowLines(w,h){
+    const dbg = plane._dbg || {};
+    const windX = dbg.windX ?? 0;
+    const windY = dbg.windY ?? 0;
+    const flowX = -windX;
+    const flowY = -windY;
+    const flowLen = Math.hypot(flowX, flowY);
+    const nx = flowLen > 1 ? flowX / flowLen : 1;
+    const ny = flowLen > 1 ? flowY / flowLen : 0;
+    const spacing = 46;
+    const segments = 10;
+    const step = 16;
+
+    ctx.save();
+    ctx.globalAlpha = 0.22;
+    ctx.strokeStyle = "#9fd0ff";
+    ctx.lineWidth = 1.5;
+    for(let i=0;i<segments;i++){
+      const offset = (i - segments/2) * spacing + (camera.x % spacing);
+      const baseX = (w/2) + offset;
+      const baseY = 100 + (i*13)%220;
+      ctx.beginPath();
+      for(let s=0;s<7;s++){
+        const px = baseX + nx * s * step + Math.sin((baseY+s*17)*0.03) * 4;
+        const py = baseY + ny * s * step;
+        if(s===0) ctx.moveTo(px, py);
+        else ctx.lineTo(px, py);
+      }
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+
   // roundRect polyfill
   if(!CanvasRenderingContext2D.prototype.roundRect){
     CanvasRenderingContext2D.prototype.roundRect = function(x,y,w,h,r){
@@ -306,7 +522,7 @@
     const pitchTargetRate = pitchCmd * 2.2;          // how hard elevator responds
     plane.pitchRate = lerp(plane.pitchRate, pitchTargetRate, 1 - Math.exp(-9*dt));
     plane.pitch += plane.pitchRate * dt;
-    plane.pitch = clamp(plane.pitch, -0.65, 0.65);   // keep it flyable
+    plane.pitch = clamp(plane.pitch, -1.1, 1.1);   // allow more rotation
 
     // roll/bank
     const rollTargetRate = ail * 3.2;
@@ -367,11 +583,14 @@
 
     const windWx = (wind.gust.x + turbX + thermalWx) * shear;
     const windWy = (wind.gust.y + turbY + thermalWy) * shear;
+    const windSmooth = 1 - Math.exp(-4 * dt);
+    wind.smooth.x = lerp(wind.smooth.x, windWx, windSmooth);
+    wind.smooth.y = lerp(wind.smooth.y, windWy, windSmooth);
 
     // --- aerodynamics ---
     // Relative air velocity (plane relative to air mass)
-    const relVx = plane.vx - windWx;
-    const relVy = plane.vy - windWy;
+    const relVx = plane.vx - wind.smooth.x;
+    const relVy = plane.vy - wind.smooth.y;
     const V = Math.max(1e-4, Math.hypot(relVx, relVy));
 
     // Flow angle in screen coords
@@ -435,8 +654,8 @@
 
     // Air mass advection (wind carries you a bit)
     const advect = 0.55;
-    ax += (windWx - plane.vx) * advect * 0.011;
-    ay += (windWy - plane.vy) * advect * 0.011;
+    ax += (wind.smooth.x - plane.vx) * advect * 0.011;
+    ay += (wind.smooth.y - plane.vy) * advect * 0.011;
 
     // integrate
     plane.vx += ax * dt;
@@ -484,10 +703,14 @@
     const stallWarn = Math.abs(rad2deg(aoa)) > 14.5 && V < 260;
 
     readout.textContent =
-      `IAS:${ias.toFixed(0)}  ALT:${(altitude).toFixed(0)}  VS:${vs.toFixed(0)}  AoA:${rad2deg(aoa).toFixed(1)}°  Cl:${Cl.toFixed(2)}  风:${windWx.toFixed(0)},${windWy.toFixed(0)}  配平:${rad2deg(plane.trim).toFixed(0)}°  ${stallWarn?'⚠️ 失速边缘':''}`;
+      `IAS:${ias.toFixed(0)}  ALT:${(altitude).toFixed(0)}  VS:${vs.toFixed(0)}  AoA:${rad2deg(aoa).toFixed(1)}°  Cl:${Cl.toFixed(2)}  风:${wind.smooth.x.toFixed(0)},${wind.smooth.y.toFixed(0)}  配平:${rad2deg(plane.trim).toFixed(0)}°  ${stallWarn?'⚠️ 失速边缘':''}`;
 
     // Save for render effects
-    plane._dbg = {ias, altitude, vs, aoa, Cl, Cd, stallWarn, windWx, windWy, V};
+    plane._dbg = {
+      ias, altitude, vs, aoa, Cl, Cd, stallWarn, windWx, windWy, V,
+      windX: wind.smooth.x,
+      windY: wind.smooth.y,
+    };
   }
 
   // ---------- render ----------
@@ -510,6 +733,7 @@
     ctx.restore();
 
     drawThermals();
+    drawFlowLines(w,h);
     drawTerrain(w,h);
     drawPlane();
 
